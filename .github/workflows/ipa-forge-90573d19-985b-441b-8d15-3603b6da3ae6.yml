@@ -1,0 +1,87 @@
+name: IPA Forge — unsigned LiveContainer build
+on:
+  push:
+    branches:
+      - ipa-forge-*
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build unsigned iOS IPA
+    runs-on: macos-latest
+    timeout-minutes: 120
+    env:
+      XCODE_PROJECT: Madeira-0.1.3/app/Madeira.xcodeproj
+      XCODE_WORKSPACE: ""
+      XCODE_SCHEME: ""
+      BUILD_CONFIGURATION: Release
+      XCODE_PROJECT_PATH: Madeira-0.1.3/app/Madeira.xcodeproj
+      XCODE_PROJECT_KIND: project
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Build and package unsigned IPA
+        shell: bash
+        run: |-
+          set -euo pipefail
+          mkdir -p build/ipa-forge
+          : > build/ipa-forge/xcodebuild.log
+          if [ -n "$XCODE_WORKSPACE" ]; then BUILD_ARGS=(-workspace "$XCODE_WORKSPACE"); else BUILD_ARGS=(-project "$XCODE_PROJECT"); fi
+          printf 'IPA Forge GitHub Actions build\nMode: auto\nScheme: %s\nConfiguration: %s\n' "$XCODE_SCHEME" "$BUILD_CONFIGURATION"
+          xcodebuild "${BUILD_ARGS[@]}" -list -json > build/ipa-forge/xcode-list.json 2>> build/ipa-forge/xcodebuild.log
+          SCHEMES="$(python3 -c 'import json; d=json.load(open("build/ipa-forge/xcode-list.json")); x=d.get("project") or d.get("workspace") or d; print("\n".join(x.get("schemes", [])))')"
+          SCHEME_COUNT="$(printf '%s\n' "$SCHEMES" | awk 'NF { n++ } END { print n+0 }')"
+          if [ "$SCHEME_COUNT" -eq 1 ]; then
+            XCODE_SCHEME="$(printf '%s\n' "$SCHEMES" | sed -n '1p')"
+            printf 'Using the only scheme Xcode found: %s\n' "$XCODE_SCHEME"
+            xcodebuild "${BUILD_ARGS[@]}" -scheme "$XCODE_SCHEME" -configuration "$BUILD_CONFIGURATION" -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build/DerivedData CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build 2>&1 | tee build/ipa-forge/xcodebuild.log
+          else
+            if [ -n "$XCODE_PROJECT" ]; then PROJECTS_TO_SCAN="$XCODE_PROJECT"; else PROJECTS_TO_SCAN="$(find . \( -name .git -o -name Pods -o -name build -o -name DerivedData -o -name node_modules \) -prune -o -type d -name '*.xcodeproj' -prune -print | sort)"; fi
+            TARGETS_FILE="build/ipa-forge/ios-app-targets.txt"
+            : > "$TARGETS_FILE"
+            while IFS= read -r candidate_project; do
+              [ -n "$candidate_project" ] || continue
+              PROJECT_TARGETS_FILE="build/ipa-forge/current-project-targets.json"
+              if ! xcodebuild -project "$candidate_project" -list -json > "$PROJECT_TARGETS_FILE" 2>> build/ipa-forge/xcodebuild.log; then continue; fi
+              PROJECT_TARGETS="$(python3 -c 'import json; d=json.load(open("build/ipa-forge/current-project-targets.json")); x=d.get("project") or d; print("\n".join(x.get("targets", [])))')"
+              while IFS= read -r target; do
+                [ -n "$target" ] || continue
+                PRODUCT_INFO="$(xcodebuild -project "$candidate_project" -target "$target" -configuration "$BUILD_CONFIGURATION" -sdk iphoneos -showBuildSettings 2>/dev/null | awk -F' = ' '/^[[:space:]]*PRODUCT_TYPE = / { product=$2 } /^[[:space:]]*SUPPORTED_PLATFORMS = / { platforms=$2 } END { print product "\t" platforms }')"
+                PRODUCT_TYPE="${PRODUCT_INFO%%$'\t'*}"
+                SUPPORTED_PLATFORMS="${PRODUCT_INFO#*$'\t'}"
+                case "$PRODUCT_TYPE" in
+                  com.apple.product-type.application*) case " $SUPPORTED_PLATFORMS " in *" iphoneos "*) printf '%s\t%s\n' "$candidate_project" "$target" >> "$TARGETS_FILE" ;; esac ;;
+                esac
+              done <<< "$PROJECT_TARGETS"
+            done <<< "$PROJECTS_TO_SCAN"
+            TARGET_COUNT="$(wc -l < "$TARGETS_FILE" | tr -d '[:space:]')"
+            if [ "$TARGET_COUNT" -ne 1 ]; then echo 'No scheme was included and Xcode could not identify exactly one iOS application target. Mark the intended scheme Shared and include it, or configure a single iOS app target.' >&2; exit 1; fi
+            AUTO_APP_PROJECT="$(cut -f1 "$TARGETS_FILE")"
+            AUTO_APP_TARGET="$(cut -f2 "$TARGETS_FILE")"
+            if [ -n "$XCODE_WORKSPACE" ]; then AUTO_BUILD_ARGS=(-workspace "$XCODE_WORKSPACE"); else AUTO_BUILD_ARGS=(-project "$AUTO_APP_PROJECT"); fi
+            printf 'No scheme was included; building the detected iOS app target: %s\n' "$AUTO_APP_TARGET"
+            xcodebuild "${AUTO_BUILD_ARGS[@]}" -target "$AUTO_APP_TARGET" -configuration "$BUILD_CONFIGURATION" -sdk iphoneos -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= build 2>&1 | tee build/ipa-forge/xcodebuild.log
+          fi
+          APP_PATH=""
+          if [ -n "$XCODE_SCHEME" ]; then
+            APP_DIR="build/DerivedData/Build/Products/$BUILD_CONFIGURATION-iphoneos"
+            if [ -d "$APP_DIR/$XCODE_SCHEME.app" ]; then APP_PATH="$APP_DIR/$XCODE_SCHEME.app"; fi
+            if [ -z "$APP_PATH" ]; then APP_PATH="$(find "$APP_DIR" -maxdepth 1 -type d -name '*.app' -print -quit)"; fi
+          else
+            APP_PATH="$(find "$HOME/Library/Developer/Xcode/DerivedData" -type d -path "*/Build/Products/$BUILD_CONFIGURATION-iphoneos/*.app" -print -quit)"
+          fi
+          if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then echo 'No iOS .app output was found. Check the selected scheme or detected app target.' >&2; exit 1; fi
+          IPA_NAME="$(basename "$APP_PATH" .app)"
+          mkdir -p build/ipa-forge/Payload
+          cp -R "$APP_PATH" build/ipa-forge/Payload/
+          cd build/ipa-forge && zip -qr "$IPA_NAME.ipa" Payload
+          printf 'Unsigned IPA created at build/ipa-forge/%s.ipa\n' "$IPA_NAME"
+      - name: Upload unsigned IPA artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ipa-forge-unsigned
+          path: build/ipa-forge/*.ipa
+          if-no-files-found: error
+          retention-days: 14
